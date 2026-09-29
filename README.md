@@ -5,6 +5,12 @@
 
 ---
 
+## Application UIUX
+
+![image](https://github.com/TheNickDeveloper/financial_rag_agent_poc/blob/main/application_uiux.png)
+
+---
+
 ## 1. What Problem This POC Solves
 
 Financial research teams face a daily flood of long-form reports — broker research, asset allocation white papers, quantitative strategy articles. This knowledge sits in PDFs and folders. Retrieval relies on keywords. Understanding relies on human memory.

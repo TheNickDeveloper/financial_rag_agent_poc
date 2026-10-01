@@ -1,8 +1,9 @@
 import streamlit as st
 from pathlib import Path
+
 from rag_engine import RAGEngine, LOCAL_EMBEDDING_MODELS
-from agent import FinancialAgent
 from llm import LLMConfigError
+from agent_graph import FinancialAgentGraph
 
 st.set_page_config(
     page_title="Financial Knowledge Agent",
@@ -13,11 +14,15 @@ st.set_page_config(
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
+GRAPH_DIR = "graph_output"
+
 st.title("📊 Financial Knowledge Agent")
 st.caption("RAG + Agentic Skills POC for financial research and knowledge Q&A")
 
 
-# ---------- 缓存：避免每次 rerun 都重建向量库 / 加载 ONNX 模型 ----------
+# ------------------------------------------------------------------ #
+# Cached resources
+# ------------------------------------------------------------------ #
 @st.cache_resource
 def get_rag(embedding_provider, embedding_model):
     return RAGEngine(
@@ -28,28 +33,24 @@ def get_rag(embedding_provider, embedding_model):
 
 @st.cache_resource
 def get_agent(_rag, provider, model, top_k, use_llm_router):
-    return FinancialAgent(
+    return FinancialAgentGraph(
         rag=_rag,
         provider=provider,
         model=model,
         top_k=top_k,
-        use_llm_router=use_llm_router
+        use_llm_router=use_llm_router,
     )
 
 
+# ------------------------------------------------------------------ #
+# Sidebar
+# ------------------------------------------------------------------ #
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    provider = st.selectbox(
-        "LLM Provider",
-        ["DeepSeek", "OpenAI"]
-    )
+    provider = st.selectbox("LLM Provider", ["DeepSeek", "OpenAI"])
 
-    if provider == "DeepSeek":
-        default_model = "deepseek-chat"
-    else:
-        default_model = "gpt-4o-mini"
-
+    default_model = "deepseek-chat" if provider == "DeepSeek" else "gpt-4o-mini"
     model = st.text_input("Model", value=default_model)
 
     embedding_provider = st.selectbox(
@@ -104,10 +105,17 @@ with st.sidebar:
             rag_for_ingest = get_rag(embedding_provider, embedding_model)
             result = rag_for_ingest.ingest_directory(DATA_DIR)
         st.success(
-            f"Indexed {result['documents']} documents / {result['chunks']} chunks."
+            f"Indexed {result['documents']} documents / "
+            f"{result['chunks']} chunks."
         )
-        # ingest 后清掉 agent 缓存，让下次问答用同一个 rag 实例
         get_agent.clear()
+
+    st.divider()
+
+    if st.button("🧹 Clear chat history", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.saved_graphs = {}
+        st.rerun()
 
     st.divider()
     st.markdown("""
@@ -122,10 +130,20 @@ with st.sidebar:
     """)
 
 
-# ---------- Session state ----------
+# ------------------------------------------------------------------ #
+# Session state
+# ------------------------------------------------------------------ #
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "saved_graphs" not in st.session_state:
+    # Map from message index -> saved file path, so we don't re-save.
+    st.session_state.saved_graphs = {}
+
+
+# ------------------------------------------------------------------ #
+# Build rag + agent
+# ------------------------------------------------------------------ #
 rag = get_rag(embedding_provider, embedding_model)
 
 try:
@@ -134,44 +152,93 @@ except LLMConfigError as exc:
     st.error(str(exc))
     st.stop()
 
-for msg in st.session_state.messages:
+
+# ------------------------------------------------------------------ #
+# Helper: graph controls under an assistant message
+# ------------------------------------------------------------------ #
+def render_graph_controls(message_index: int, agent: FinancialAgentGraph):
+    saved = st.session_state.saved_graphs.get(message_index)
+
+    if saved:
+        st.caption(f"🖼️ Graph saved: `{saved}`")
+        return
+
+    with st.expander("📊 Generate the graph for this run?"):
+        st.caption(
+            "Render the agent's nodes and edges as a PNG into `graph_output/`."
+        )
+        if st.button("💾 Generate Graph", key=f"gen_graph_{message_index}"):
+            try:
+                path = agent.save_graph_image(
+                    output_dir=GRAPH_DIR,
+                    fmt="png",
+                )
+                st.session_state.saved_graphs[message_index] = path
+                st.success(f"Saved to: {path}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed to generate graph: {exc}")
+
+
+# ------------------------------------------------------------------ #
+# Render chat history (with skill / sources / graph controls)
+# ------------------------------------------------------------------ #
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+        if msg["role"] == "assistant":
+            # --- skill / route 提示 ---
+            route = msg.get("route") or {}
+            if route and msg.get("skill"):
+                icon = "🧠" if route.get("source") == "llm" else "🔤"
+                st.caption(
+                    f"{icon} Skill: **{msg['skill']}** "
+                    f"via {route.get('source')} router"
+                    f" · {route.get('reason', '')}"
+                )
+
+            # --- sources ---
+            if msg.get("sources"):
+                with st.expander("📚 Sources"):
+                    for s in msg["sources"]:
+                        st.markdown(
+                            f"**{s['source']}** — page/chunk "
+                            f"{s.get('page', '-')}\n\n"
+                            f"> {s['snippet']}"
+                        )
+
+            # --- graph 控件 ---
+            render_graph_controls(idx, agent)
+
+
+# ------------------------------------------------------------------ #
+# Chat input
+# ------------------------------------------------------------------ #
 prompt = st.chat_input(
     "Ask about companies, financial reports, risks, financial metrics..."
 )
 
 if prompt:
+    # 1. Append user message
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Researching..."):
+    # 2. Run agent
+    with st.spinner("Researching..."):
+        try:
             response = agent.run(prompt)
+        except Exception as exc:
+            st.error(f"Agent failed: {exc}")
+            st.stop()
 
-        st.markdown(response["answer"])
-
-        route = response.get("route") or {}
-        if route:
-            icon = "🧠" if route.get("source") == "llm" else "🔤"
-            st.caption(
-                f"{icon} Skill: **{response['skill']}** "
-                f"via {route.get('source')} router"
-                f" · {route.get('reason', '')}"
-            )
-
-        if response.get("sources"):
-            with st.expander("📚 Sources"):
-                for s in response["sources"]:
-                    st.markdown(
-                        f"**{s['source']}** — page/chunk {s.get('page', '-')}\n\n"
-                        f"> {s['snippet']}"
-                    )
-
+    # 3. Append assistant message with all metadata
     st.session_state.messages.append({
         "role": "assistant",
-        "content": response["answer"]
+        "content": response["answer"],
+        "skill": response.get("skill"),
+        "route": response.get("route") or {},
+        "sources": response.get("sources") or [],
     })
+
+    # 4. Rerun so the history loop renders everything (including new msg)
+    st.rerun()

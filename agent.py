@@ -1,16 +1,16 @@
+# agent.py
+"""
+Shared prompts, routing rules and helpers for the financial agent.
+
+The actual agent implementation lives in agent_graph.py (LangGraph).
+This module is intentionally free of any agent class so there is only
+one way to run the agent.
+"""
+
 import os
 from typing import Literal
 
 from pydantic import BaseModel, Field
-
-from llm import create_llm
-from skills import (
-    retrieval_skill,
-    summary_skill,
-    comparison_skill,
-    risk_skill,
-    synthesis_skill
-)
 
 
 SYSTEM_PROMPT = """
@@ -38,15 +38,6 @@ Classify the user request into exactly one skill:
 
 Reply with the skill name only.
 """
-
-
-SKILL_PROMPT_BUILDERS = {
-    "retrieval": retrieval_skill,
-    "summary": summary_skill,
-    "comparison": comparison_skill,
-    "risk": risk_skill,
-    "synthesis": synthesis_skill
-}
 
 
 RULE_KEYWORDS = {
@@ -105,115 +96,3 @@ class RouteDecision(BaseModel):
         default="",
         description="One short sentence explaining the routing decision"
     )
-
-
-class FinancialAgent:
-
-    def __init__(self, rag, provider, model, top_k=5,
-                 use_llm_router=True, router_provider=None,
-                 router_model=None):
-        self.rag = rag
-        self.llm = create_llm(provider, model)
-        self.top_k = top_k
-        self.use_llm_router = use_llm_router
-        self.router = None
-        self.router_name = None
-
-        if use_llm_router:
-            router_model = resolve_router_model(
-                router_provider or provider,
-                router_model,
-                model
-            )
-            self.router_name = f"{router_provider or provider}:{router_model}"
-            self.router = create_llm(
-                router_provider or provider,
-                router_model
-            )
-
-    def rule_route(self, question):
-        q = question.lower()
-
-        scores = {
-            skill: sum(1 for k in kws if k in q)
-            for skill, kws in RULE_KEYWORDS.items()
-        }
-
-        skill = max(
-            scores,
-            key=lambda s: (scores[s], SKILL_TIE_BREAK[s])
-        )
-
-        return {
-            "skill": skill if scores[skill] else "retrieval",
-            "source": "rule",
-            "reason": (
-                f"matched keywords: {scores[skill]}"
-                if scores[skill]
-                else "no keyword match, defaulting to retrieval"
-            )
-        }
-
-    def llm_route(self, question):
-        classifier = self.router.with_structured_output(RouteDecision)
-
-        decision = classifier.invoke(
-            ROUTER_SYSTEM_PROMPT
-            + "\n\nUser request:\n"
-            + question
-        )
-
-        return {
-            "skill": decision.skill,
-            "source": "llm",
-            "reason": decision.reason or f"classified as {decision.skill}"
-        }
-
-    def route(self, question):
-        if self.router is None:
-            return self.rule_route(question)
-
-        try:
-            return self.llm_route(question)
-
-        except Exception as exc:
-            fallback = self.rule_route(question)
-            fallback["reason"] = (
-                f"LLM router failed ({type(exc).__name__}), "
-                f"fell back to rules"
-            )
-            return fallback
-
-    def run(self, question):
-        route = self.route(question)
-        skill = route["skill"]
-
-        docs = self.rag.search(question, self.top_k)
-
-        context = "\n\n".join([
-            f"[Source: {d['source']} | Page: {d['page']}]\n{d['content']}"
-            for d in docs
-        ])
-
-        instruction = SKILL_PROMPT_BUILDERS[skill](question, context)
-
-        prompt = SYSTEM_PROMPT + "\n\n" + instruction
-
-        answer = self.llm.invoke(prompt)
-
-        sources = [
-            {
-                "source": d["source"],
-                "page": d["page"],
-                "snippet": d["content"][:400]
-            }
-            for d in docs
-        ]
-
-        return {
-            "answer": answer.content if hasattr(answer, "content") else str(answer),
-            "sources": sources,
-            "skill": skill,
-            "route": route,
-            "router": self.router_name
-        }

@@ -1,7 +1,5 @@
 import os
-
 from dotenv import load_dotenv
-
 load_dotenv()
 
 
@@ -29,7 +27,10 @@ def create_llm(provider, model):
         from langchain_deepseek import ChatDeepSeek
 
         if not os.getenv("DEEPSEEK_API_KEY"):
-            raise LLMConfigError(...)
+            raise LLMConfigError(
+                "DEEPSEEK_API_KEY is not set. Add it to .env, or switch the "
+                "LLM Provider in the sidebar."
+            )
 
         return ChatDeepSeek(
             model=model,

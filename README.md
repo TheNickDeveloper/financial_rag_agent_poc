@@ -1,4 +1,4 @@
-# Financial Knowledge Agent — RAG + Agentic Skills POC
+# Financial Knowledge Agent — RAG + Agentic Skills on LangGraph
 
 > A knowledge agent that reads financial research reports, answers domain-specific questions, and honestly says "I don't know" when the knowledge base doesn't cover it.
 > This document breaks down how it works from a workflow perspective, and what value it delivers to the business.
@@ -59,10 +59,47 @@ Vectors + original text + metadata are stored in ChromaDB, inserted in batches t
 Question → Routing → Retrieval → Context Assembly → LLM Generation → Answer + Sources
 ```
 
+#### ⚙️ Orchestration: LangGraph StateGraph
+
+The online Q&A flow is orchestrated with **[LangGraph](https://github.com/langchain-ai/langgraph)**,
+not a plain LangChain chain. `agent_graph.py` defines a `StateGraph` whose
+nodes share a typed `AgentState`:
+
+```
+START → route → retrieve → build_instruction → generate → END
+```
+
+| Node | Responsibility |
+| --- | --- |
+| `route` | Classify the request into one of five skills (LLM router, keyword-rule fallback) |
+| `retrieve` | Pull the Top-K chunks from ChromaDB and build the context block |
+| `build_instruction` | Render the skill-specific prompt via `skills.py` |
+| `generate` | Call the LLM and produce the grounded answer |
+
+How the steps below map to graph nodes:
+
+| Step | Graph node |
+| --- | --- |
+| Step 7 — Routing | `route` |
+| Step 8 — Semantic Retrieval | `retrieve` |
+| Step 9 — Context Assembly | `retrieve` |
+| Step 10 — LLM Generation | `build_instruction` → `generate` |
+
+Why LangGraph instead of a linear chain:
+
+- **Explicit state** — every intermediate value (`skill`, `docs`, `context`, `instruction`, `answer`) lives in `AgentState`, so the data flow is inspectable and debuggable.
+- **Graceful fallback** — if the LLM router fails, the `route` node silently falls back to keyword rules; the run never breaks.
+- **Extensible by design** — any linear edge can be swapped for a conditional edge to add self-correcting retrieval, human-in-the-loop review, or multi-agent routing without rewriting the nodes.
+- **Visualizable** — the compiled graph can be exported as a PNG directly from the UI (the "Generate Graph" button under each answer).
+
+The graph is compiled once in `FinancialAgentGraph.__init__` and reused across all queries.
+
+#### Step-by-step
+
 **Step 6 | User Asks a Question**
 For example: "What is return stacking?"
 
-**Step 7 | Routing (The Agentic Core)**
+**Step 7 | Routing — LangGraph `route` node**
 The agent first determines what type of question this is, then selects the appropriate handling strategy. Five skills:
 
 | Skill         | Trigger Scenario            | Output Structure                                       |
@@ -70,18 +107,18 @@ The agent first determines what type of question this is, then selects the appro
 | 🔎 Retrieval  | Factual lookup              | Concise answer + inline citations                      |
 | 📄 Summary    | Report summarization        | Executive summary + key facts + risks                  |
 | 📊 Comparison | Company/strategy comparison | Neutral comparison table                               |
-| ⚠️ Risk     | Risk analysis               | Market/business/financial/operational/regulatory risks |
+| ⚠️ Risk       | Risk analysis               | Market/business/financial/operational/regulatory risks |
 | 🧠 Synthesis  | Cross-document synthesis    | Common themes + conflicts + open questions             |
 
 Routing has two layers: **LLM routing** (primary, smarter) + **rule-based routing** (fallback, works even when the API fails).
 
-**Step 8 | Semantic Retrieval**
+**Step 8 | Semantic Retrieval — LangGraph `retrieve` node**
 The question is embedded and matched against the Top-K nearest chunks in ChromaDB. Smaller distance = more semantically relevant.
 
-**Step 9 | Context Assembly**
+**Step 9 | Context Assembly — also inside the `retrieve` node**
 Retrieved chunks are concatenated into a context block with source annotations — each snippet labeled with filename and page number.
 
-**Step 10 | LLM Generation**
+**Step 10 | LLM Generation — LangGraph `build_instruction` → `generate` nodes**
 "System constraints + skill instruction + retrieved context" are combined into the final prompt and sent to the LLM.
 
 The key here is the **hard constraint in the System Prompt**:
@@ -112,16 +149,16 @@ FastEmbed ONNX → 384-dim Vectors
     ↓
 ChromaDB (vectors + text + metadata)
 
-【ONLINE Q&A】
+【ONLINE Q&A — LangGraph StateGraph】
 User Question
     ↓
-Router (LLM / Rules) → Determines Skill
+[route] Router (LLM / Rules) → Determines Skill
     ↓
-Question Embedding → ChromaDB Similarity Search → Top-K chunks
+[retrieve] Question Embedding → ChromaDB Similarity Search → Top-K chunks
     ↓
-Assemble Context + Skill Prompt + System Prompt
+[build_instruction] Assemble Context + Skill Prompt + System Prompt
     ↓
-LLM Generation (grounded in context, not its own knowledge)
+[generate] LLM Generation (grounded in context, not its own knowledge)
     ↓
 Answer + Sources → Streamlit Render
 ```
@@ -171,17 +208,20 @@ The current architecture scales horizontally: add more document sources (interna
 
 ## 5. Tech Stack Summary
 
-| Layer       | Technology                     | Role                                       |
-| ----------- | ------------------------------ | ------------------------------------------ |
-| Frontend    | Streamlit                      | Chat UI + file upload                      |
-| Routing     | LLM + rule engine              | Determines which skill to use              |
-| Retrieval   | FastEmbed (ONNX) + ChromaDB    | Semantic search                            |
-| Generation  | DeepSeek / OpenAI              | Context-grounded answer generation         |
-| Constraints | System Prompt                  | Prevents hallucination, enforces citations |
-| Chunking    | RecursiveCharacterTextSplitter | Long-document segmentation                 |
+| Layer         | Technology                     | Role                                                              |
+| ------------- | ------------------------------ | ----------------------------------------------------------------- |
+| Frontend      | Streamlit                      | Chat UI + file upload                                             |
+| Orchestration | LangGraph (StateGraph)         | Agent workflow: `route → retrieve → build_instruction → generate` |
+| Routing       | LLM + rule engine              | Determines which skill to use                                     |
+| Retrieval     | FastEmbed (ONNX) + ChromaDB    | Semantic search                                                   |
+| Generation    | DeepSeek / OpenAI              | Context-grounded answer generation                                |
+| Constraints   | System Prompt                  | Prevents hallucination, enforces citations                        |
+| Chunking      | RecursiveCharacterTextSplitter | Long-document segmentation                                        |
 
 ---
 
 ## 6. One-Sentence Summary
 
 > The core value of this POC isn't "letting an LLM answer questions" — it's **making the LLM answer only from the knowledge you provide, and tell you where every answer came from**. That's what finance actually needs from AI.
+>
+> And it does so with an **explicit LangGraph workflow** — every step (routing, retrieval, prompt assembly, generation) is a named node in a state graph, so the logic is inspectable, testable, and ready to grow into self-correcting retrieval or human-in-the-loop review.
